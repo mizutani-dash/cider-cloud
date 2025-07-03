@@ -2,46 +2,210 @@ import os
 import sqlite3
 import pandas as pd
 from datetime import datetime
-from flask import Flask, request, render_template, redirect, url_for, jsonify, send_file
+from flask import Flask, request, render_template, redirect, url_for, jsonify, send_file, flash
 from werkzeug.utils import secure_filename
 import hashlib
 import traceback
 import io
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
 import re
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+from email.mime.text import MIMEText
+import smtplib
+from dotenv import load_dotenv
+from email.mime.text import MIMEText
+import smtplib
 
-# --- 1. アプリケーションの初期設定 ---
+load_dotenv()
+
 app = Flask(__name__)
-# CSVアップロード機能用の設定
+app.secret_key = "your-secret-key"
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['DATABASE'] = 'database.db'
 app.config['ALLOWED_EXTENSIONS'] = {'csv'}
 
-# アップロード用フォルダの作成
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-
-# --- 2. ヘルパー関数 ---
 
 # Googleスプレッドシートへの接続
 
 def connect_sheets():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    json_content = os.environ.get('GOOGLE_CREDENTIALS_JSON')
-    creds_dict = json.loads(json_content)
+
+    json_path = os.environ.get('GOOGLE_CREDENTIALS_PATH')
+    if not json_path:
+        raise ValueError("⚠️ GOOGLE_CREDENTIALS_PATH が読み込めていません！")
+
+    try:
+        with open(json_path) as f:
+            creds_dict = json.load(f)
+    except Exception as e:
+        raise ValueError(f"⚠️ JSONファイルの読み込みに失敗しました: {e}")
+
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     sheet = client.open('【開発用】シードル出庫台帳')
-    return sheet.worksheet('出庫情報'), sheet.worksheet('出庫詳細')
+    return sheet.worksheet('在庫一覧'),  sheet.worksheet('出庫情報'), sheet.worksheet('出庫詳細')
+
+
+# --- メール送信用関数群 ---
+def get_available_items():
+    在庫一覧シート, _, _ = connect_sheets()
+    data = 在庫一覧シート.get_all_records()
+    available = [row for row in data if isinstance(row['現在庫'], int) and row['現在庫'] > 0]
+    return available
+
+def create_email_body(items):
+    header = (
+        "取引先様　各位\n"
+        "いつもお世話になっております。有限会社マルカメ果樹園（マルカメ醸造所）の北沢毅です。\n"
+        "現在のシードル/ワイン在庫をお送りいたします。\n"
+        "発注の際はこちらのメール宛にご返信いただけましたら幸いです。\n\n"
+        "【現在の在庫】\n"
+    )
+    if not items:
+        stock_info = "現在、在庫のある商品はありません。\n"
+    else:
+        stock_info = "\n".join([f"- {row['商品名']}（{row['現在庫']}本）" for row in items]) + "\n"
+    footer = "\nご不明点がございましたらお気軽にお問い合わせください。\n今後ともよろしくお願いいたします。\n"
+    return header + stock_info + footer
+
+def extract_valid_emails(raw_text):
+    cleaned = re.sub(r'[\s\u3000]+', ',', raw_text)
+    candidates = cleaned.split(',')
+    pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+    return [email.strip() for email in candidates if re.match(pattern, email.strip())]
+
+def send_email(body, to_email):
+    from_email = os.environ.get('EMAIL_USER')
+    password = os.environ.get('EMAIL_PASS')
+    msg = MIMEText(body)
+    msg['Subject'] = "在庫情報のお知らせ"
+    msg['From'] = from_email
+    msg['To'] = to_email
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(from_email, password)
+        server.send_message(msg)
+
+def save_email_log_xlsx(email, status, error_msg=''):
+    log_file = 'email_log.xlsx'
+    if os.path.exists(log_file):
+        wb = load_workbook(log_file)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "送信ログ"
+        ws.append(['送信先', '送信日時', '結果', 'エラーメッセージ'])
+    ws.append([
+        email,
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        status,
+        error_msg
+    ])
+    for column_cells in ws.columns:
+        length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
+        ws.column_dimensions[get_column_letter(column_cells[0].column)].width = length + 2
+    wb.save(log_file)
+
+
+#出庫詳細データ振り分け用の関数
+def 振り分け処理(row, 出庫情報シート, sheets):
+    出庫ID, 商品名, 数量 = row
+
+    # 出庫IDから出庫先を取得
+    出庫情報一覧 = 出庫情報シート.get_all_values()
+    出庫先 = None
+    for info_row in 出庫情報一覧[1:]:  # ヘッダーを除く
+        if info_row[0] == 出庫ID:
+            出庫先 = info_row[2]
+            break
+
+    if 出庫先 is None:
+        print(f"出庫ID {出庫ID} に対応する出庫先が見つかりませんでした")
+        return
+
+    # 出庫先に応じて振り分けて記録
+    振り分けデータ = [出庫ID, 商品名, 数量, 出庫先]
+    if 出庫先 == "取引先への出荷":
+        sheets["卸"].append_row(振り分けデータ)
+    elif 出庫先 in ["通販", "店頭販売", "課税出荷（イベント等）", "持ち出し"]:
+        sheets["店頭等"].append_row(振り分けデータ)
+
+
+# --- メール送信用のルーティング ---
+@app.route('/email', methods=['GET', 'POST'])
+def send_email_page():
+    items = get_available_items()
+    if request.method == 'POST':
+        raw_emails = request.form.get('emails', '')
+        email_list = extract_valid_emails(raw_emails)
+        body = create_email_body(items)
+        if not email_list:
+            flash('有効なメールアドレスが見つかりませんでした。', 'danger')
+        else:
+            for email in email_list:
+                try:
+                    send_email(body, email)
+                    save_email_log_xlsx(email, '成功')
+                except Exception as e:
+                    save_email_log_xlsx(email, '失敗', str(e))
+                    flash(f'{email} 宛ての送信に失敗しました: {str(e)}', 'danger')
+            else:
+                flash(f'{len(email_list)} 件のメールを送信しました。', 'success')
+            return redirect(url_for('send_email_page'))
+    return render_template('email_index.html', items=items)
+
+@app.route('/logs')
+def view_logs():
+    logs = []
+    header = []
+    try:
+        wb = load_workbook('email_log.xlsx')
+        ws = wb.active
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i == 0:
+                header = list(row)
+            else:
+                logs.append(list(row))
+    except FileNotFoundError:
+        header = ['送信先', '送信日時', '結果', 'エラーメッセージ']
+        logs = []
+    return render_template('logs.html', header=header, logs=logs)
+
+# --- 以下、既存の出庫登録やCSVアップロード機能などを続けて追記 ---
+# （この後ろに元の出庫管理ルーティングを貼り付けてください）
+
+
+#プルダウン形式での出庫情報入力
+def get_shukkosaki_options():
+    sheet = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(
+        json.load(open(os.environ['GOOGLE_CREDENTIALS_PATH'])),
+        ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    )).open('【開発用】シードル出庫台帳').worksheet('出庫先')
+    return sheet.col_values(1)[1:]  # ヘッダーを除く
+
+def get_product_options():
+    sheet = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(
+        json.load(open(os.environ['GOOGLE_CREDENTIALS_PATH'])),
+        ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    )).open('【開発用】シードル出庫台帳').worksheet('商品名')
+    return sheet.col_values(1)[1:]
+
+def get_staff_options():
+    sheet = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(
+        json.load(open(os.environ['GOOGLE_CREDENTIALS_PATH'])),
+        ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    )).open('【開発用】シードル出庫台帳').worksheet('スタッフ')
+    return sheet.col_values(1)[1:]
 
 
 # 新しい出庫IDを生成
 def generate_unique_id(出庫情報シート):
     """日付ベースのユニークな出庫IDを生成する (例: 240521-001)"""
-    today_str = datetime.datetime.now().strftime("%y%m%d")
+    today_str = datetime.now().strftime("%y%m%d")
     all_values = 出庫情報シート.get_all_values()
     # ヘッダー行を除き、今日の日付で始まるIDをフィルタリング
     all_ids = [row[0] for row in all_values[1:] if row and row[0].startswith(today_str)]
@@ -103,40 +267,77 @@ init_db()
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     """手動での出庫情報登録ページ"""
+
     if request.method == 'POST':
         出庫日 = request.form['date']
         出庫先 = request.form['destination']
         担当者 = request.form['staff']
         取引先 = request.form.get('client', '')
 
-        出庫情報シート, 出庫詳細シート = connect_sheets()
+        gc = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(
+            json.load(open(os.environ['GOOGLE_CREDENTIALS_PATH'])),
+            ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        ))
+        workbook = gc.open('【開発用】シードル出庫台帳')
+
+        出庫情報シート = workbook.worksheet('出庫情報')
+        出庫詳細シート = workbook.worksheet('出庫詳細')
+        出庫詳細_卸シート = workbook.worksheet('出庫詳細（卸）')
+        出庫詳細_直販シート = workbook.worksheet('出庫詳細（店頭、通販等）')
+
         出庫ID = generate_unique_id(出庫情報シート)
 
+        # 出庫情報を書き込み
         出庫情報シート.append_row([出庫ID, 出庫日, 出庫先, 取引先, 担当者])
 
+        # 商品データの収集
         details_to_append = []
         for i in range(1, 6):
             商品名 = request.form.get(f'item{i}')
             数量 = request.form.get(f'qty{i}')
             if 商品名 and 数量:
                 details_to_append.append([出庫ID, 商品名, 数量])
-        
+
+        # 出庫詳細シート（共通）に書き込み
         if details_to_append:
-            # 複数行を一度に追加
             出庫詳細シート.append_rows(details_to_append, value_input_option='USER_ENTERED')
+
+            # 出庫先に応じて詳細を別シートにも分岐保存
+            if 出庫先 == '取引先への出荷':
+                出庫詳細_卸シート.append_rows(details_to_append, value_input_option='USER_ENTERED')
+            else:
+                出庫詳細_直販シート.append_rows(details_to_append, value_input_option='USER_ENTERED')
 
         return render_template(
             'success.html',
             message="出庫情報を登録しました",
             redirect_url=url_for('register')
         )
-    return render_template('register.html')
+
+    # GETリクエスト時：プルダウンの選択肢を取得してフォームに渡す
+    def get_dropdown_values(sheet_name):
+        sheet = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(
+            json.load(open(os.environ['GOOGLE_CREDENTIALS_PATH'])),
+            ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        )).open('【開発用】シードル出庫台帳').worksheet(sheet_name)
+        return sheet.col_values(1)[1:]  # ヘッダー行を除く
+
+    shukkosaki_options = get_dropdown_values('出庫先')
+    product_options = get_dropdown_values('商品名')
+    staff_options = get_dropdown_values('スタッフ')
+
+    return render_template(
+        'register.html',
+        shukkosaki_options=shukkosaki_options,
+        product_options=product_options,
+        staff_options=staff_options
+    )
 
 
 @app.route('/list')
 def list_data():
     """出庫情報の一覧ページ"""
-    出庫情報シート, _ = connect_sheets()
+    _, 出庫情報シート, _ = connect_sheets() 
     出庫情報 = 出庫情報シート.get_all_values()
     return render_template('list.html', 出庫情報=出庫情報)
 
@@ -144,7 +345,7 @@ def list_data():
 @app.route('/detail/<shukko_id>')
 def detail(shukko_id):
     """出庫情報の詳細ページ"""
-    出庫情報シート, 出庫詳細シート = connect_sheets()
+    _ , 出庫情報シート, 出庫詳細シート = connect_sheets()
     出庫情報リスト = 出庫情報シート.get_all_values()
     出庫情報 = next((row for row in 出庫情報リスト if row[0] == shukko_id), None)
     出庫詳細リスト = 出庫詳細シート.get_all_values()
@@ -155,7 +356,7 @@ def detail(shukko_id):
 @app.route('/edit/<shukko_id>', methods=['GET', 'POST'])
 def edit(shukko_id):
     """出庫情報の編集ページ"""
-    出庫情報シート, _ = connect_sheets()
+    出庫情報シート, _, _ = connect_sheets()
     出庫情報リスト = 出庫情報シート.get_all_values()
     index = None
     出庫情報 = None
@@ -182,10 +383,28 @@ def edit(shukko_id):
     return render_template('edit.html', 出庫ID=shukko_id, 出庫情報=出庫情報)
 
 
+@app.route('/delete/<shukko_id>')
+def delete_shukko(shukko_id):
+    _ , 出庫情報シート, 出庫詳細シート = connect_sheets()
+
+    # 出庫情報シートから対象行を削除
+    cell = 出庫情報シート.find(shukko_id)
+    if cell:
+        出庫情報シート.delete_rows(cell.row)
+
+    # 出庫詳細シートからも関連行を削除
+    cells = 出庫詳細シート.findall(shukko_id)
+    for c in reversed(cells):  # 後ろから削除しないとインデックスずれる
+        出庫詳細シート.delete_rows(c.row)
+
+    return redirect(url_for('list_data'))  # 一覧に戻る
+
+
+
 @app.route('/edit-detail/<shukko_id>', methods=['GET', 'POST'])
 def edit_detail(shukko_id):
     """出庫詳細の編集ページ"""
-    _, 出庫詳細シート = connect_sheets()
+    _, _, 出庫詳細シート = connect_sheets()
     # 該当する出庫IDの行をすべて削除
     # gspreadには特定の条件で行を削除する簡単なAPIがないため、一度クリアして再追加するアプローチが一般的
     
@@ -226,6 +445,34 @@ def edit_detail(shukko_id):
     出庫詳細リスト = 出庫詳細シート.get_all_values()
     出庫詳細 = [row for row in 出庫詳細リスト if row[0] == shukko_id]
     return render_template('edit_detail.html', 出庫ID=shukko_id, 出庫詳細=出庫詳細)
+
+
+@app.route('/edit-detail/<shukko_id>/<detail_id>', methods=['POST'])
+def edit_shukko_detail(shukko_id, detail_id):
+    new_name = request.form['product_name']
+    new_qty = request.form['quantity']
+    出庫詳細シート = connect_sheets()[1]
+
+    # detail_idをキーにして該当行を探し更新
+    cell = 出庫詳細シート.find(detail_id)
+    if cell:
+        row = cell.row
+        出庫詳細シート.update_cell(row, 3, new_name)  # 商品名
+        出庫詳細シート.update_cell(row, 4, new_qty)   # 数量
+
+    return redirect(url_for('detail', 出庫ID=shukko_id))
+
+
+@app.route('/delete-detail/<shukko_id>/<detail_id>')
+def delete_detail(shukko_id, detail_id):
+    出庫詳細シート = connect_sheets()[1]
+
+    cell = 出庫詳細シート.find(detail_id)
+    if cell:
+        出庫詳細シート.delete_rows(cell.row)
+
+    return redirect(url_for('detail', 出庫ID=shukko_id))
+
 
 
 def process_and_store_csv(filepath, filename, file_hash):
